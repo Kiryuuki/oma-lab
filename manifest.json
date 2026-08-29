@@ -1,0 +1,21 @@
+{
+  "schemaVersion": 1,
+  "id": "kiryuuki.oma-lab",
+  "name": "OmaLab",
+  "version": "1.0.0",
+  "author": "Kiryuuki",
+  "license": "MIT",
+  "description": "Homelab services monitor & launcher with live telemetry for Proxmox VE, KASM, Jellyfin, Sonarr, Radarr, n8n, and Dokploy.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "OmaLab",
+    "description": "Homelab services telemetry monitor & launcher",
+    "category": "Tools",
+    "allowMultiple": false
+  }
+}
