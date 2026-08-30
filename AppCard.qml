@@ -15,6 +15,7 @@ BorderSurface {
   property color urgent: Color.urgent
   property string fontFamily: Style.font.family
   property bool expanded: false
+  property bool isSelected: false
 
   signal launchRequested(string url)
   signal actionRequested(string serviceId, string actionName, var payload)
@@ -37,10 +38,14 @@ BorderSurface {
   width: parent ? parent.width : Style.space(520)
   implicitHeight: cardCol.implicitHeight + Style.space(16)
   radius: Style.cornerRadius
-  color: Style.hoverFillFor(root.foreground, root.foreground)
-  borderSpec: root.expanded
-    ? Border.controlSpec("selected", Color.accent, Color.accent)
-    : (hoverArea.containsMouse ? Border.controlSpec("focus", Color.accent, Color.accent) : Border.controlSpec("normal", root.subtle, Color.accent))
+  color: isSelected
+    ? Qt.rgba(Color.accent.r, Color.accent.g, Color.accent.b, 0.16)
+    : Style.hoverFillFor(root.foreground, root.foreground)
+  borderSpec: isSelected
+    ? Border.controlSpec("focus", Color.accent, Color.accent)
+    : (root.expanded
+      ? Border.controlSpec("selected", Color.accent, Color.accent)
+      : (hoverArea.containsMouse ? Border.controlSpec("focus", Color.accent, Color.accent) : Border.controlSpec("normal", root.subtle, Color.accent)))
 
   Behavior on borderSpec { ColorAnimation { duration: 120 } }
 

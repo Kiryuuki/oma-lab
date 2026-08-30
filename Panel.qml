@@ -198,6 +198,9 @@ Panel {
     onTriggered: panelRoot.refresh()
   }
 
+  property int selectedIndex: 0
+  readonly property var visibleServices: (panelRoot.homelabState.services || []).filter(function(s) { return panelRoot.isServiceInCategory(s, panelRoot.activeCategory) })
+
   KeyboardPanel {
     id: panel
     anchorItem: panelRoot.anchorItem
@@ -213,6 +216,46 @@ Panel {
       anchors.fill: parent
       onCloseRequested: panelRoot.close()
       onTabRequested: function(direction) { panelRoot.switchPanel(direction) }
+      onMoveRequested: function(dx, dy) {
+        if (dy !== 0) {
+          var maxIdx = Math.max(0, panelRoot.visibleServices.length - 1)
+          panelRoot.selectedIndex = Math.max(0, Math.min(maxIdx, panelRoot.selectedIndex + dy))
+          scrollArea.contentY = Math.max(0, Math.min(scrollArea.contentHeight - scrollArea.height, panelRoot.selectedIndex * Style.space(90)))
+        }
+      }
+      onActivateRequested: {
+        if (panelRoot.visibleServices && panelRoot.visibleServices[panelRoot.selectedIndex]) {
+          var s = panelRoot.visibleServices[panelRoot.selectedIndex]
+          if (s.url) panelRoot.launchApp(s.url)
+        }
+      }
+      onReturnRequested: {
+        if (panelRoot.visibleServices && panelRoot.visibleServices[panelRoot.selectedIndex]) {
+          var s = panelRoot.visibleServices[panelRoot.selectedIndex]
+          if (s.url) panelRoot.launchApp(s.url)
+        }
+      }
+      onDeleteRequested: {
+        if (panelRoot.visibleServices && panelRoot.visibleServices[panelRoot.selectedIndex]) {
+          var s = panelRoot.visibleServices[panelRoot.selectedIndex]
+          if (s.id) panelRoot.toggleExpanded(s.id)
+        }
+      }
+      onTextKey: function(t) {
+        if (t === "r" || t === "R") panelRoot.refresh()
+        else if (t === "s" || t === "S") panelRoot.settingsOpen = !panelRoot.settingsOpen
+        else if (t === "1") { panelRoot.activeCategory = "all"; panelRoot.selectedIndex = 0 }
+        else if (t === "2") { panelRoot.activeCategory = "media"; panelRoot.selectedIndex = 0 }
+        else if (t === "3") { panelRoot.activeCategory = "downloads"; panelRoot.selectedIndex = 0 }
+        else if (t === "4") { panelRoot.activeCategory = "infra"; panelRoot.selectedIndex = 0 }
+        else if (t === "5") { panelRoot.activeCategory = "automation"; panelRoot.selectedIndex = 0 }
+        else if (t === "e" || t === "E" || t === " ") {
+          if (panelRoot.visibleServices && panelRoot.visibleServices[panelRoot.selectedIndex]) {
+            var s = panelRoot.visibleServices[panelRoot.selectedIndex]
+            if (s.id) panelRoot.toggleExpanded(s.id)
+          }
+        }
+      }
 
       Flickable {
         id: scrollArea
@@ -440,6 +483,7 @@ Panel {
                   dim: panelRoot.dim
                   subtle: panelRoot.subtle
                   fontFamily: panelRoot.fontFamily
+                  isSelected: (panelRoot.visibleServices[panelRoot.selectedIndex] !== undefined) && (panelRoot.visibleServices[panelRoot.selectedIndex].id === modelData.id)
                   expanded: panelRoot.isExpanded(modelData.id)
                   onExpandToggled: function(id) { panelRoot.toggleExpanded(id) }
                   onLaunchRequested: function(url) { panelRoot.launchApp(url) }

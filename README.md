@@ -95,10 +95,19 @@ omarchy restart shell
 
 ## Keyboard Shortcuts
 
-When the panel is open:
-- `r`: Trigger instant manual telemetry refresh
-- `Esc`: Close panel
-- `j` / `k` or `Down` / `Up`: Navigate through services
+| Key | Action |
+|---|---|
+| `1` | Show All services |
+| `2` | Filter by Media services |
+| `3` | Filter by Downloads services |
+| `4` | Filter by Infrastructure services |
+| `5` | Filter by Automation services |
+| `Up` / `Down` or `k` / `j` | Navigate services list |
+| `Enter` / `Space` | Open selected service URL in browser |
+| `e` / `Delete` | Toggle card expansion (show/hide live widgets) |
+| `s` / `S` | Toggle In-Panel Settings |
+| `r` / `R` | Trigger instant telemetry refresh |
+| `Esc` | Close flyout |
 
 ---
 
