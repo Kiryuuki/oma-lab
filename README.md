@@ -113,4 +113,4 @@ omarchy restart shell
 
 ## License
 
-MIT License. Designed for the Omarchy Desktop Environment.
+Source-Available Non-Commercial License (PolyForm Noncommercial 1.0.0). Free for personal, educational, and homelab use. Commercial sale, distribution for fee, or commercial re-licensing is prohibited without author permission.

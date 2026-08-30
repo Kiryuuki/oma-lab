@@ -4,7 +4,7 @@
   "name": "OmaLab",
   "version": "1.0.0",
   "author": "Kiryuuki",
-  "license": "MIT",
+  "license": "Source-Available Non-Commercial (PolyForm-Noncommercial-1.0.0)",
   "description": "Homelab services monitor & launcher with live telemetry for Proxmox VE, KASM, Jellyfin, Sonarr, Radarr, n8n, and Dokploy.",
   "kinds": [
     "bar-widget"
