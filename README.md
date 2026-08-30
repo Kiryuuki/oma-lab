@@ -58,17 +58,9 @@ A native, high-performance Homelab Monitoring and Interactive Launcher plugin fo
 
 ## Installation
 
-### Method 1: Via Omarchy Plugin Manager
+Install using the Omarchy Plugin Manager:
 ```bash
 omaplug install kiryuuki.oma-lab
-```
-
-### Method 2: Manual Installation (Git Clone)
-```bash
-mkdir -p ~/.config/omarchy/plugins
-git clone https://github.com/Kiryuuki/oma-lab.git ~/.config/omarchy/plugins/kiryuuki.oma-lab
-chmod +x ~/.config/omarchy/plugins/kiryuuki.oma-lab/homelab_engine.py
-chmod +x ~/.config/omarchy/plugins/kiryuuki.oma-lab/save_config.py
 ```
 
 ### Register in `shell.json`
