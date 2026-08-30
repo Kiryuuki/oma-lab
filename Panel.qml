@@ -184,8 +184,10 @@ Panel {
   }
 
   function saveService(serviceObj) {
-    saveProcess.pendingArgs = ["save", JSON.stringify(serviceObj)]
+    saveProcess.pendingArgs = ["save"]
     saveProcess.running = true
+    saveProcess.stdin.write(JSON.stringify(serviceObj) + "\n")
+    saveProcess.stdin.close()
   }
 
   // Periodic polling timer (every 15s)
