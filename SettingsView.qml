@@ -123,8 +123,7 @@ Column {
   // Sniffer Process
   Process {
     id: sniffProcess
-    property var targetArgs: []
-    command: ["/usr/bin/python3", (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/kiryuuki.oma-lab/homelab_engine.py", "--sniff"].concat(targetArgs)
+    command: ["/usr/bin/python3", (Quickshell.env("HOME") || "") + "/.config/omarchy/plugins/kiryuuki.oma-lab/homelab_engine.py", "--sniff"]
     stdout: StdioCollector {
       id: sniffOut
       waitForEnd: true
@@ -135,13 +134,15 @@ Column {
   function runSniff() {
     root.isSniffing = true
     root.sniffResult = null
-    sniffProcess.targetArgs = [
-      "--type", root.selectedType,
-      "--url", urlInput.text.trim(),
-      "--key", keyInput.text.trim(),
-      "--secret", secretInput.text.trim()
-    ]
+    var probePayload = {
+      type: root.selectedType,
+      url: urlInput.text.trim(),
+      apiKey: keyInput.text.trim(),
+      apiSecret: secretInput.text.trim()
+    }
     sniffProcess.running = true
+    sniffProcess.stdin.write(JSON.stringify(probePayload) + "\n")
+    sniffProcess.stdin.close()
   }
 
   function toggleWidgetSelection(widgetId) {

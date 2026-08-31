@@ -1002,7 +1002,22 @@ def main():
         path = fetch_dashboard_icon(args.fetch_icon)
         print(json.dumps({"ok": bool(path), "query": args.fetch_icon, "iconPath": path}))
     elif args.sniff:
-        result = sniff_endpoints(args.type, args.url, args.key, args.secret)
+        service_type = args.type
+        service_url = args.url
+        service_key = args.key
+        service_secret = args.secret
+        if not sys.stdin.isatty():
+            try:
+                stdin_raw = sys.stdin.read().strip()
+                if stdin_raw:
+                    probe_data = json.loads(stdin_raw)
+                    service_type = probe_data.get("type", service_type)
+                    service_url = probe_data.get("url", service_url)
+                    service_key = probe_data.get("apiKey", probe_data.get("key", service_key))
+                    service_secret = probe_data.get("apiSecret", probe_data.get("secret", service_secret))
+            except Exception:
+                pass
+        result = sniff_endpoints(service_type, service_url, service_key, service_secret)
         print(json.dumps(result, indent=2))
     elif args.action:
         execute_action(args.service_id, args.action, args.payload)
