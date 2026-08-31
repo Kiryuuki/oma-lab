@@ -985,42 +985,72 @@ def poll_all_deep(config_path=DEFAULT_CONFIG, out_path=DEFAULT_STATE):
 def main():
     parser = argparse.ArgumentParser(description="Homelab Engine")
     parser.add_argument("--poll", action="store_true", help="Run full deep telemetry polling")
-    parser.add_argument("--sniff", action="store_true", help="Sniff and discover endpoints for a service")
+    parser.add_argument("--sniff", action="store_true", help="Sniff and discover endpoints for a service (payload via stdin)")
+    parser.add_argument("--save-config", action="store_true", help="Save service configuration passed via stdin with 0600 permissions")
     parser.add_argument("--fetch-icon", help="Fetch and cache icon from DashboardIcons for name/slug")
-    parser.add_argument("--type", default="generic", help="Service type for sniffing")
-    parser.add_argument("--url", default="", help="Service URL for sniffing")
-    parser.add_argument("--key", default="", help="Service API key for sniffing")
-    parser.add_argument("--secret", default="", help="Service API secret for dual-auth sniffing")
     parser.add_argument("--action", help="Action name to execute")
     parser.add_argument("--service-id", help="Target service ID")
-    parser.add_argument("--payload", default="{}", help="JSON payload for action")
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="Path to homelab.json")
     parser.add_argument("--out", default=DEFAULT_STATE, help="Path to homelab-status.json")
     args = parser.parse_args()
 
-    if args.fetch_icon:
+    if args.save_config:
+        raw_stdin = sys.stdin.read().strip() if not sys.stdin.isatty() else ""
+        if raw_stdin:
+            try:
+                new_s = json.loads(raw_stdin)
+                if isinstance(new_s, dict):
+                    cfg = load_config(args.config)
+                    services = cfg.setdefault("services", [])
+                    s_id = new_s.get("id") or f"{new_s.get('type', 'app')}-{int(time.time())}"
+                    new_s["id"] = s_id
+                    found = False
+                    for idx, s in enumerate(services):
+                        if s.get("id") == s_id:
+                            services[idx] = new_s
+                            found = True
+                            break
+                    if not found:
+                        services.append(new_s)
+                    write_atomic(args.config, cfg)
+                    print(json.dumps({"ok": True, "serviceId": s_id}))
+                    sys.exit(0)
+            except Exception as e:
+                print(json.dumps({"ok": False, "error": str(e)}))
+                sys.exit(1)
+        print(json.dumps({"ok": False, "error": "No config payload provided on stdin"}))
+        sys.exit(1)
+    elif args.fetch_icon:
         path = fetch_dashboard_icon(args.fetch_icon)
         print(json.dumps({"ok": bool(path), "query": args.fetch_icon, "iconPath": path}))
     elif args.sniff:
-        service_type = args.type
-        service_url = args.url
-        service_key = args.key
-        service_secret = args.secret
+        service_type = "generic"
+        service_url = ""
+        service_key = ""
+        service_secret = ""
         if not sys.stdin.isatty():
             try:
                 stdin_raw = sys.stdin.read().strip()
                 if stdin_raw:
                     probe_data = json.loads(stdin_raw)
-                    service_type = probe_data.get("type", service_type)
-                    service_url = probe_data.get("url", service_url)
-                    service_key = probe_data.get("apiKey", probe_data.get("key", service_key))
-                    service_secret = probe_data.get("apiSecret", probe_data.get("secret", service_secret))
+                    service_type = probe_data.get("type", "generic")
+                    service_url = probe_data.get("url", "")
+                    service_key = probe_data.get("apiKey", probe_data.get("key", ""))
+                    service_secret = probe_data.get("apiSecret", probe_data.get("secret", ""))
             except Exception:
                 pass
         result = sniff_endpoints(service_type, service_url, service_key, service_secret)
         print(json.dumps(result, indent=2))
     elif args.action:
-        execute_action(args.service_id, args.action, args.payload)
+        payload_str = "{}"
+        if not sys.stdin.isatty():
+            try:
+                stdin_raw = sys.stdin.read().strip()
+                if stdin_raw:
+                    payload_str = stdin_raw
+            except Exception:
+                pass
+        execute_action(args.service_id, args.action, payload_str)
     else:
         poll_all_deep(args.config, args.out)
 
