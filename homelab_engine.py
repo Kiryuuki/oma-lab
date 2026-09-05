@@ -7,10 +7,12 @@ DashboardIcons fetching, Proxmox cluster metrics, n8n active sorting, and action
 
 import argparse
 import concurrent.futures
+import ipaddress
 import json
 import os
 import re
 import ssl
+import stat
 import sys
 import tempfile
 import time
@@ -62,22 +64,177 @@ ICON_ALIASES = {
     "paperless-ngx": "paperless-ngx",
 }
 
-# SSL context allowing self-signed certificates on local LAN instances
-SSL_UNVERIFIED_CTX = ssl.create_default_context()
-SSL_UNVERIFIED_CTX.check_hostname = False
-SSL_UNVERIFIED_CTX.verify_mode = ssl.CERT_NONE
+MAX_RESPONSE_BYTES = 512 * 1024  # 512 KB
+MAX_ERROR_BYTES = 32 * 1024     # 32 KB
+MAX_ICON_BYTES = 256 * 1024     # 256 KB
+MAX_STATE_BYTES = 512 * 1024    # 512 KB
+
+# Strict verified TLS Context
+SSL_VERIFIED_CTX = ssl.create_default_context()
+
+
+def is_loopback(hostname: str) -> bool:
+    if not hostname:
+        return False
+    h = hostname.lower().strip("[]")
+    if h in ("localhost", "127.0.0.1", "::1"):
+        return True
+    try:
+        ip = ipaddress.ip_address(h)
+        return ip.is_loopback
+    except ValueError:
+        return False
+
+
+def validate_service_url(url: str, has_credentials: bool = False) -> tuple:
+    """
+    Validates URL scheme and destination.
+    Insecure HTTP is strictly rejected when credentials are present,
+    unless targeting validated loopback addresses (127.0.0.1, ::1, localhost).
+    """
+    url = (url or "").strip()
+    if not url:
+        raise ValueError("URL cannot be empty")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("https", "http"):
+        raise ValueError(f"Invalid URL scheme: {parsed.scheme}. Must be https:// or http://")
+    if not parsed.netloc or not parsed.hostname:
+        raise ValueError("Invalid URL host")
+
+    if parsed.scheme == "http" and has_credentials:
+        if not is_loopback(parsed.hostname):
+            raise ValueError(
+                f"Insecure HTTP scheme is forbidden for credential-bearing endpoint '{parsed.hostname}' "
+                "unless using a literal loopback address (127.0.0.1, ::1, localhost)"
+            )
+    return url, parsed
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Restricts HTTP/HTTPS redirects strictly to the same canonical scheme, host, and port."""
+    def __init__(self, allow_http_loopback: bool = False):
+        super().__init__()
+        self.allow_http_loopback = allow_http_loopback
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        orig_parsed = urllib.parse.urlsplit(req.full_url)
+        new_parsed = urllib.parse.urlsplit(newurl)
+
+        if orig_parsed.scheme == "https" and new_parsed.scheme == "http":
+            raise urllib.error.HTTPError(
+                newurl, code, "Protocol downgrade from HTTPS to HTTP during redirect is forbidden", headers, fp
+            )
+
+        if new_parsed.scheme not in ("https", "http"):
+            raise urllib.error.HTTPError(
+                newurl, code, f"Unsupported redirect scheme: {new_parsed.scheme}", headers, fp
+            )
+
+        orig_port = orig_parsed.port or (443 if orig_parsed.scheme == "https" else 80)
+        new_port = new_parsed.port or (443 if new_parsed.scheme == "https" else 80)
+
+        if (orig_parsed.scheme != new_parsed.scheme or
+            (orig_parsed.hostname or "").lower() != (new_parsed.hostname or "").lower() or
+            orig_port != new_port):
+            raise urllib.error.HTTPError(
+                newurl, code, "Cross-origin redirects are forbidden to prevent credential leakage", headers, fp
+            )
+
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def read_bounded(resp, max_bytes: int = MAX_RESPONSE_BYTES, chunk_size: int = 16384) -> bytes:
+    """Reads response body with strict upper byte ceiling to prevent unbounded memory consumption."""
+    content_length = resp.headers.get("Content-Length")
+    if content_length and content_length.isdigit() and int(content_length) > max_bytes:
+        raise ValueError(f"Response Content-Length {content_length} exceeds ceiling of {max_bytes} bytes")
+
+    chunks = []
+    total = 0
+    while True:
+        chunk = resp.read(chunk_size)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > max_bytes:
+            raise ValueError(f"Response size exceeded ceiling of {max_bytes} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def sanitize_text(text, max_len: int = 200) -> str:
+    if text is None:
+        return ""
+    clean = re.sub(r'[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '', str(text)).strip()
+    return clean[:max_len]
+
+
+def sanitize_svg(raw_bytes: bytes) -> bool:
+    """Strictly validates and sanitizes SVG icons to prevent script injection and XXE attacks."""
+    if not raw_bytes or len(raw_bytes) > MAX_ICON_BYTES:
+        return False
+    try:
+        text = raw_bytes.decode("utf-8", errors="ignore").lower()
+    except Exception:
+        return False
+
+    if "<svg" not in text or "</svg>" not in text:
+        return False
+
+    dangerous_patterns = [
+        r"<script\b",
+        r"onload\s*=",
+        r"onerror\s*=",
+        r"onclick\s*=",
+        r"on\w+\s*=",
+        r"javascript:",
+        r"<!doctype",
+        r"<!entity",
+        r"<iframe\b",
+        r"<object\b",
+        r"<embed\b",
+        r"<foreignobject\b",
+        r'xlink:href\s*=\s*["\']javascript:',
+    ]
+    for pat in dangerous_patterns:
+        if re.search(pat, text):
+            return False
+    return True
+
+
+def load_config(path=DEFAULT_CONFIG):
+    p = Path(path)
+    if not p.exists():
+        return {"version": 1, "refreshIntervalSeconds": 30, "services": []}
+    try:
+        st = p.stat()
+        if st.st_uid != os.getuid() or not stat.S_ISREG(st.st_mode):
+            return {"version": 1, "refreshIntervalSeconds": 30, "services": []}
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {"version": 1, "refreshIntervalSeconds": 30, "services": []}
+    except Exception:
+        return {"version": 1, "refreshIntervalSeconds": 30, "services": []}
 
 
 def write_atomic(path, doc):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    raw_bytes = (json.dumps(doc, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    if len(raw_bytes) > MAX_STATE_BYTES:
+        raise ValueError(f"Payload size {len(raw_bytes)} exceeds ceiling {MAX_STATE_BYTES}")
+
     handle, temp_name = tempfile.mkstemp(dir=str(path.parent), suffix=".tmp")
     try:
-        with os.fdopen(handle, "w", encoding="utf-8") as stream:
-            json.dump(doc, stream, ensure_ascii=False, indent=2)
-            stream.write("\n")
+        os.fchmod(handle, 0o600)
+        with os.fdopen(handle, "wb") as stream:
+            stream.write(raw_bytes)
             stream.flush()
             os.fsync(stream.fileno())
+        if path.exists():
+            st = path.lstat()
+            if not stat.S_ISREG(st.st_mode) or st.st_uid != os.getuid():
+                path.unlink(missing_ok=True)
         os.replace(temp_name, path)
     except BaseException:
         Path(temp_name).unlink(missing_ok=True)
@@ -116,6 +273,27 @@ def build_proxmox_auth_header(api_key, api_secret):
 def make_request(url, headers=None, method="GET", body=None, timeout=4.0):
     headers = headers or {}
     headers.setdefault("User-Agent", "omarchy-homelab/2.0")
+
+    has_creds = False
+    for k in headers:
+        if k.lower() in ("authorization", "x-api-key", "x-emby-token", "x-n8n-api-key", "token"):
+            has_creds = True
+            break
+    if isinstance(body, dict):
+        if any(k in body for k in ("api_key", "api_key_secret", "apiKey", "apiSecret", "token")):
+            has_creds = True
+
+    try:
+        valid_url, parsed = validate_service_url(url, has_credentials=has_creds)
+    except Exception as e:
+        return {
+            "ok": False,
+            "status": 0,
+            "latencyMs": 0,
+            "error": f"URL validation error: {str(e)}",
+            "json": None,
+        }
+
     if body is not None and isinstance(body, (dict, list)):
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
@@ -124,12 +302,22 @@ def make_request(url, headers=None, method="GET", body=None, timeout=4.0):
     else:
         data = None
 
-    req = urllib.request.Request(url, headers=headers, data=data, method=method)
+    allow_loopback = is_loopback(parsed.hostname or "")
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=SSL_VERIFIED_CTX),
+        SafeRedirectHandler(allow_http_loopback=allow_loopback),
+    )
+    req = urllib.request.Request(valid_url, headers=headers, data=data, method=method)
     start_t = time.perf_counter()
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=SSL_UNVERIFIED_CTX) as resp:
+        with opener.open(req, timeout=timeout) as resp:
             latency = int((time.perf_counter() - start_t) * 1000)
-            raw = resp.read()
+            final_url = resp.geturl()
+            final_parsed = urllib.parse.urlsplit(final_url)
+            if has_creds and final_parsed.scheme == "http" and not is_loopback(final_parsed.hostname or ""):
+                raise ValueError("Final redirected URL resolved to insecure HTTP with credentials")
+
+            raw = read_bounded(resp, max_bytes=MAX_RESPONSE_BYTES)
             charset = resp.headers.get_content_charset() or "utf-8"
             text = raw.decode(charset, errors="ignore")
             try:
@@ -146,7 +334,7 @@ def make_request(url, headers=None, method="GET", body=None, timeout=4.0):
     except urllib.error.HTTPError as e:
         latency = int((time.perf_counter() - start_t) * 1000)
         try:
-            raw_err = e.read()
+            raw_err = read_bounded(e, max_bytes=MAX_ERROR_BYTES)
             err_json = json.loads(raw_err.decode("utf-8", errors="ignore"))
         except Exception:
             err_json = None
@@ -194,30 +382,50 @@ def fetch_dashboard_icon(name_or_type):
     slug = re.sub(r"[^a-z0-9]+", "-", raw_clean).strip("-")
     slug = ICON_ALIASES.get(slug, slug)
 
+    local_file = LOCAL_ASSETS_DIR / f"{slug}.svg"
+    if local_file.exists() and local_file.stat().st_size > 50:
+        return str(local_file)
+
     ICONS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     cached_file = ICONS_CACHE_DIR / f"{slug}.svg"
     if cached_file.exists() and cached_file.stat().st_size > 50:
         return str(cached_file)
-
-    local_file = LOCAL_ASSETS_DIR / f"{slug}.svg"
-    if local_file.exists() and local_file.stat().st_size > 50:
-        return str(local_file)
 
     urls = [
         f"https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/{slug}.svg",
         f"https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/svg/{slug}.svg",
     ]
 
+    opener = urllib.request.build_opener(
+        urllib.request.HTTPSHandler(context=SSL_VERIFIED_CTX),
+        SafeRedirectHandler(allow_http_loopback=False),
+    )
+
     for cdn_url in urls:
         try:
+            parsed = urllib.parse.urlsplit(cdn_url)
+            if parsed.scheme != "https" or (parsed.hostname or "").lower() != "cdn.jsdelivr.net":
+                continue
+
             req = urllib.request.Request(cdn_url, headers={"User-Agent": "omarchy-homelab/2.0"})
-            with urllib.request.urlopen(req, timeout=4, context=SSL_UNVERIFIED_CTX) as resp:
+            with opener.open(req, timeout=4) as resp:
+                final_parsed = urllib.parse.urlsplit(resp.geturl())
+                if final_parsed.scheme != "https" or (final_parsed.hostname or "").lower() != "cdn.jsdelivr.net":
+                    continue
                 if resp.status == 200:
-                    content = resp.read()
-                    if b"<svg" in content:
-                        with open(cached_file, "wb") as f:
-                            f.write(content)
-                        return str(cached_file)
+                    raw_svg = read_bounded(resp, max_bytes=MAX_ICON_BYTES)
+                    if sanitize_svg(raw_svg):
+                        handle, temp_name = tempfile.mkstemp(dir=str(ICONS_CACHE_DIR), suffix=".tmp")
+                        try:
+                            os.fchmod(handle, 0o644)
+                            with os.fdopen(handle, "wb") as f:
+                                f.write(raw_svg)
+                                f.flush()
+                                os.fsync(f.fileno())
+                            os.replace(temp_name, cached_file)
+                            return str(cached_file)
+                        except Exception:
+                            Path(temp_name).unlink(missing_ok=True)
         except Exception:
             continue
 
@@ -601,10 +809,10 @@ def poll_service_deep(service):
                 "diskUsedStr": format_bytes(used_disk),
                 "diskTotalStr": format_bytes(total_disk),
                 "diskPercent": disk_percent,
-                "vms": vms_list,
+                "vms": vms_list[:100],
                 "vmsRunning": running_vms,
                 "vmsTotal": len(vms_list),
-                "lxcs": lxc_list,
+                "lxcs": lxc_list[:100],
                 "lxcsRunning": running_lxcs,
                 "lxcsTotal": len(lxc_list),
                 "hasMetrics": total_mem > 0 or len(vms_list) > 0 or len(lxc_list) > 0,
@@ -689,7 +897,7 @@ def poll_service_deep(service):
                 })
 
             res["widgetsData"]["now_playing"] = {
-                "sessions": active_sessions,
+                "sessions": active_sessions[:50],
                 "count": len(active_sessions),
             }
 
@@ -736,7 +944,7 @@ def poll_service_deep(service):
             res["widgetsData"]["pending_requests"] = {
                 "pendingCount": pending_count,
                 "processingCount": processing_count,
-                "requests": pending_items,
+                "requests": pending_items[:100],
             }
 
             if pending_count > 0:
@@ -786,7 +994,7 @@ def poll_service_deep(service):
 
             res["widgetsData"]["download_queue"] = {
                 "total": q_res["json"].get("totalRecords", len(queue_items)),
-                "items": queue_items,
+                "items": queue_items[:100],
             }
 
             if queue_items:
@@ -824,7 +1032,7 @@ def poll_service_deep(service):
             res["widgetsData"]["active_workflows"] = {
                 "activeCount": active_count,
                 "totalCount": len(wf_list),
-                "workflows": wf_list,
+                "workflows": wf_list[:100],
             }
 
             if active_count > 0:
@@ -878,13 +1086,7 @@ def poll_service_deep(service):
 # 3. INTERACTIVE ACTIONS DISPATCHER
 # =========================================================================
 def execute_action(service_id, action, payload_str):
-    cfg_path = DEFAULT_CONFIG
-    if not cfg_path.exists():
-        print(json.dumps({"ok": False, "error": "Config not found"}))
-        return
-
-    with open(cfg_path, "r", encoding="utf-8") as f:
-        cfg = json.load(f)
+    cfg = load_config(DEFAULT_CONFIG)
 
     service = next((s for s in cfg.get("services", []) if s.get("id") == service_id), None)
     if not service:
@@ -975,7 +1177,7 @@ def poll_all_deep(config_path=DEFAULT_CONFIG, out_path=DEFAULT_STATE):
             "online": total_online,
             "alerts": alerts,
         },
-        "services": results,
+        "services": results[:200],
     }
 
     write_atomic(out_path, doc)
