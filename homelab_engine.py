@@ -24,8 +24,7 @@ from pathlib import Path
 
 DEFAULT_CONFIG = Path.home() / ".config" / "omarchy" / "homelab.json"
 DEFAULT_STATE = Path.home() / ".local" / "state" / "omarchy" / "homelab-status.json"
-ICONS_CACHE_DIR = Path.home() / ".local" / "state" / "omarchy" / "homelab-icons"
-LOCAL_ASSETS_DIR = Path.home() / ".config" / "omarchy" / "plugins" / "kiryuuki.oma-lab" / "assets"
+LOCAL_ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 
 ICON_MAP = {
     "jellyfin": "󰟀",
@@ -270,7 +269,19 @@ def build_proxmox_auth_header(api_key, api_secret):
     return f"PVEAPIToken={key}"
 
 
-def make_request(url, headers=None, method="GET", body=None, timeout=4.0):
+def make_request(url, headers=None, method="GET", body=None, timeout=4.0, deadline=None):
+    if deadline is not None:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return {
+                "ok": False,
+                "status": 0,
+                "latencyMs": 0,
+                "error": "Poll deadline exceeded",
+                "json": None,
+            }
+        timeout = min(timeout, remaining)
+
     headers = headers or {}
     headers.setdefault("User-Agent", "omarchy-homelab/2.0")
 
@@ -375,6 +386,11 @@ def try_healthcheck_fallback(raw_url):
 
 
 def fetch_dashboard_icon(name_or_type):
+    """
+    Resolves local vendored icon asset for a given service or type.
+    Runtime remote downloading is completely removed to guarantee deterministic,
+    immutable, supply-chain safe local execution without network dependencies.
+    """
     if not name_or_type:
         return ""
 
@@ -386,48 +402,9 @@ def fetch_dashboard_icon(name_or_type):
     if local_file.exists() and local_file.stat().st_size > 50:
         return str(local_file)
 
-    ICONS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    cached_file = ICONS_CACHE_DIR / f"{slug}.svg"
-    if cached_file.exists() and cached_file.stat().st_size > 50:
-        return str(cached_file)
-
-    urls = [
-        f"https://cdn.jsdelivr.net/gh/homarr-labs/dashboard-icons/svg/{slug}.svg",
-        f"https://cdn.jsdelivr.net/gh/walkxcode/dashboard-icons/svg/{slug}.svg",
-    ]
-
-    opener = urllib.request.build_opener(
-        urllib.request.HTTPSHandler(context=SSL_VERIFIED_CTX),
-        SafeRedirectHandler(allow_http_loopback=False),
-    )
-
-    for cdn_url in urls:
-        try:
-            parsed = urllib.parse.urlsplit(cdn_url)
-            if parsed.scheme != "https" or (parsed.hostname or "").lower() != "cdn.jsdelivr.net":
-                continue
-
-            req = urllib.request.Request(cdn_url, headers={"User-Agent": "omarchy-homelab/2.0"})
-            with opener.open(req, timeout=4) as resp:
-                final_parsed = urllib.parse.urlsplit(resp.geturl())
-                if final_parsed.scheme != "https" or (final_parsed.hostname or "").lower() != "cdn.jsdelivr.net":
-                    continue
-                if resp.status == 200:
-                    raw_svg = read_bounded(resp, max_bytes=MAX_ICON_BYTES)
-                    if sanitize_svg(raw_svg):
-                        handle, temp_name = tempfile.mkstemp(dir=str(ICONS_CACHE_DIR), suffix=".tmp")
-                        try:
-                            os.fchmod(handle, 0o644)
-                            with os.fdopen(handle, "wb") as f:
-                                f.write(raw_svg)
-                                f.flush()
-                                os.fsync(f.fileno())
-                            os.replace(temp_name, cached_file)
-                            return str(cached_file)
-                        except Exception:
-                            Path(temp_name).unlink(missing_ok=True)
-        except Exception:
-            continue
+    fallback_file = Path.home() / ".config" / "omarchy" / "plugins" / "kiryuuki.oma-lab" / "assets" / f"{slug}.svg"
+    if fallback_file.exists() and fallback_file.stat().st_size > 50:
+        return str(fallback_file)
 
     return ""
 
@@ -643,7 +620,10 @@ def sniff_endpoints(service_type, url, api_key="", api_secret=""):
 # =========================================================================
 # 2. DEEP TELEMETRY POLLING WITH PROXMOX & N8N SORTING
 # =========================================================================
-def poll_service_deep(service):
+def poll_service_deep(service, deadline=None):
+    if deadline is None:
+        deadline = time.monotonic() + 15.0
+
     s_type = service.get("type", "generic").lower()
     s_name = service.get("name") or s_type.capitalize()
     raw_url = service.get("url", "").rstrip("/")
@@ -672,6 +652,10 @@ def poll_service_deep(service):
     if not res["enabled"] or not raw_url:
         return res
 
+    if time.monotonic() >= deadline:
+        res["statusText"] = "Poll deadline exceeded"
+        return res
+
     api_succeeded = False
 
     # ----------------------------------------------------
@@ -682,16 +666,27 @@ def poll_service_deep(service):
         headers = {"Authorization": auth_header} if auth_header else {}
 
         # 1. First probe version or nodes to verify auth
-        ver_resp = make_request(f"{raw_url}/api2/json/version", headers=headers)
-        nodes_resp = make_request(f"{raw_url}/api2/json/nodes", headers=headers)
+        ver_resp = make_request(f"{raw_url}/api2/json/version", headers=headers, deadline=deadline)
+        nodes_resp = make_request(f"{raw_url}/api2/json/nodes", headers=headers, deadline=deadline)
 
         if ver_resp["ok"] or nodes_resp["ok"]:
             api_succeeded = True
             res["online"] = True
             res["latencyMs"] = ver_resp.get("latencyMs") or nodes_resp.get("latencyMs") or 10
 
-            nodes_data = nodes_resp.get("json", {}).get("data", []) if nodes_resp.get("ok") else []
-            node_names = [n.get("node") for n in nodes_data if n.get("node")] or ["pve"]
+            raw_nodes_data = nodes_resp.get("json", {}).get("data", []) if nodes_resp.get("ok") else []
+            if not isinstance(raw_nodes_data, list):
+                raw_nodes_data = []
+
+            # Hard cardinality limit on Proxmox nodes (reject over-limit collection before iterating)
+            MAX_PROXMOX_NODES = 16
+            if len(raw_nodes_data) > MAX_PROXMOX_NODES:
+                res["statusText"] = f"Rejected: Proxmox node count ({len(raw_nodes_data)}) exceeds limit ({MAX_PROXMOX_NODES})"
+                res["badge"] = "Over Limit"
+                res["badgeType"] = "warning"
+                return res
+
+            node_names = [n.get("node") for n in raw_nodes_data if isinstance(n, dict) and n.get("node") and isinstance(n.get("node"), str)] or ["pve"]
 
             vms_list = []
             lxc_list = []
@@ -702,92 +697,125 @@ def poll_service_deep(service):
             cpu_usages = []
             permission_error = False
 
-            # Query each node's status, VMs, and LXCs directly
+            MAX_PROXMOX_VMS = 100
+            MAX_PROXMOX_LXCS = 100
+
+            # Query each node's status, VMs, and LXCs directly with deadline checks
             for node in node_names:
+                if time.monotonic() >= deadline:
+                    break
+
                 # Node live metrics
-                n_status_resp = make_request(f"{raw_url}/api2/json/nodes/{node}/status", headers=headers)
+                n_status_resp = make_request(f"{raw_url}/api2/json/nodes/{node}/status", headers=headers, deadline=deadline)
                 if n_status_resp["ok"] and isinstance(n_status_resp.get("json"), dict):
                     nd = n_status_resp["json"].get("data", {})
-                    # CPU
-                    if "cpu" in nd:
-                        cpu_usages.append(float(nd.get("cpu", 0)))
-                    # Memory
-                    mem_obj = nd.get("memory", {})
-                    if mem_obj:
-                        total_mem += mem_obj.get("total", 0)
-                        used_mem += mem_obj.get("used", 0)
-                    elif nd.get("maxmem"):
-                        total_mem += nd.get("maxmem", 0)
-                        used_mem += nd.get("mem", 0)
-                    # Rootfs/Disk
-                    disk_obj = nd.get("rootfs", {})
-                    if disk_obj:
-                        total_disk += disk_obj.get("total", 0)
-                        used_disk += disk_obj.get("used", 0)
+                    if isinstance(nd, dict):
+                        # CPU
+                        if "cpu" in nd:
+                            cpu_usages.append(float(nd.get("cpu", 0)))
+                        # Memory
+                        mem_obj = nd.get("memory", {})
+                        if isinstance(mem_obj, dict) and mem_obj:
+                            total_mem += mem_obj.get("total", 0)
+                            used_mem += mem_obj.get("used", 0)
+                        elif nd.get("maxmem"):
+                            total_mem += nd.get("maxmem", 0)
+                            used_mem += nd.get("mem", 0)
+                        # Rootfs/Disk
+                        disk_obj = nd.get("rootfs", {})
+                        if isinstance(disk_obj, dict) and disk_obj:
+                            total_disk += disk_obj.get("total", 0)
+                            used_disk += disk_obj.get("used", 0)
                 elif n_status_resp.get("status") == 403:
                     permission_error = True
 
-                # Node VMs (QEMU)
-                qemu_resp = make_request(f"{raw_url}/api2/json/nodes/{node}/qemu", headers=headers)
-                if qemu_resp["ok"] and isinstance(qemu_resp.get("json"), dict):
-                    for vm in qemu_resp["json"].get("data", []):
-                        vms_list.append({
-                            "id": vm.get("vmid"),
-                            "name": vm.get("name") or f"VM {vm.get('vmid')}",
-                            "status": vm.get("status", "stopped"),
-                            "running": vm.get("status") == "running",
-                            "node": node,
-                            "cpu": int(round(float(vm.get("cpu", 0)) * 100)),
-                            "memStr": format_bytes(vm.get("mem", 0)),
-                            "maxmemStr": format_bytes(vm.get("maxmem", 0)),
-                        })
+                if time.monotonic() >= deadline:
+                    break
 
-                # Node LXCs
-                lxc_resp = make_request(f"{raw_url}/api2/json/nodes/{node}/lxc", headers=headers)
-                if lxc_resp["ok"] and isinstance(lxc_resp.get("json"), dict):
-                    for ct in lxc_resp["json"].get("data", []):
-                        lxc_list.append({
-                            "id": ct.get("vmid"),
-                            "name": ct.get("name") or f"CT {ct.get('vmid')}",
-                            "status": ct.get("status", "stopped"),
-                            "running": ct.get("status") == "running",
-                            "node": node,
-                            "cpu": int(round(float(ct.get("cpu", 0)) * 100)),
-                            "memStr": format_bytes(ct.get("mem", 0)),
-                            "maxmemStr": format_bytes(ct.get("maxmem", 0)),
-                        })
+                # Node VMs (QEMU) with capped ingestion
+                if len(vms_list) < MAX_PROXMOX_VMS:
+                    qemu_resp = make_request(f"{raw_url}/api2/json/nodes/{node}/qemu", headers=headers, deadline=deadline)
+                    if qemu_resp["ok"] and isinstance(qemu_resp.get("json"), dict):
+                        qemu_data = qemu_resp["json"].get("data", [])
+                        if isinstance(qemu_data, list):
+                            for vm in qemu_data:
+                                if len(vms_list) >= MAX_PROXMOX_VMS or time.monotonic() >= deadline:
+                                    break
+                                if not isinstance(vm, dict):
+                                    continue
+                                vms_list.append({
+                                    "id": vm.get("vmid"),
+                                    "name": vm.get("name") or f"VM {vm.get('vmid')}",
+                                    "status": vm.get("status", "stopped"),
+                                    "running": vm.get("status") == "running",
+                                    "node": node,
+                                    "cpu": int(round(float(vm.get("cpu", 0)) * 100)),
+                                    "memStr": format_bytes(vm.get("mem", 0)),
+                                    "maxmemStr": format_bytes(vm.get("maxmem", 0)),
+                                })
 
-            # Check cluster resources as complementary source
-            res_resp = make_request(f"{raw_url}/api2/json/cluster/resources", headers=headers)
-            if res_resp["ok"] and isinstance(res_resp.get("json"), dict):
-                items = res_resp["json"].get("data", [])
-                for item in items:
-                    itype = item.get("type")
-                    if itype == "qemu" and not any(v["id"] == item.get("vmid") for v in vms_list):
-                        vms_list.append({
-                            "id": item.get("vmid"),
-                            "name": item.get("name") or f"VM {item.get('vmid')}",
-                            "status": item.get("status", "stopped"),
-                            "running": item.get("status") == "running",
-                            "node": item.get("node", "pve"),
-                            "cpu": int(round(float(item.get("cpu", 0)) * 100)),
-                            "memStr": format_bytes(item.get("mem", 0)),
-                            "maxmemStr": format_bytes(item.get("maxmem", 0)),
-                        })
-                    elif itype == "lxc" and not any(c["id"] == item.get("vmid") for c in lxc_list):
-                        lxc_list.append({
-                            "id": item.get("vmid"),
-                            "name": item.get("name") or f"CT {item.get('vmid')}",
-                            "status": item.get("status", "stopped"),
-                            "running": item.get("status") == "running",
-                            "node": item.get("node", "pve"),
-                            "cpu": int(round(float(item.get("cpu", 0)) * 100)),
-                            "memStr": format_bytes(item.get("mem", 0)),
-                            "maxmemStr": format_bytes(item.get("maxmem", 0)),
-                        })
-                    elif itype == "storage" and total_disk == 0:
-                        total_disk += item.get("maxdisk", 0)
-                        used_disk += item.get("disk", 0)
+                if time.monotonic() >= deadline:
+                    break
+
+                # Node LXCs with capped ingestion
+                if len(lxc_list) < MAX_PROXMOX_LXCS:
+                    lxc_resp = make_request(f"{raw_url}/api2/json/nodes/{node}/lxc", headers=headers, deadline=deadline)
+                    if lxc_resp["ok"] and isinstance(lxc_resp.get("json"), dict):
+                        lxc_data = lxc_resp["json"].get("data", [])
+                        if isinstance(lxc_data, list):
+                            for ct in lxc_data:
+                                if len(lxc_list) >= MAX_PROXMOX_LXCS or time.monotonic() >= deadline:
+                                    break
+                                if not isinstance(ct, dict):
+                                    continue
+                                lxc_list.append({
+                                    "id": ct.get("vmid"),
+                                    "name": ct.get("name") or f"CT {ct.get('vmid')}",
+                                    "status": ct.get("status", "stopped"),
+                                    "running": ct.get("status") == "running",
+                                    "node": node,
+                                    "cpu": int(round(float(ct.get("cpu", 0)) * 100)),
+                                    "memStr": format_bytes(ct.get("mem", 0)),
+                                    "maxmemStr": format_bytes(ct.get("maxmem", 0)),
+                                })
+
+            # Check cluster resources as complementary source (with deadline & caps)
+            if time.monotonic() < deadline and (len(vms_list) < MAX_PROXMOX_VMS or len(lxc_list) < MAX_PROXMOX_LXCS or total_disk == 0):
+                res_resp = make_request(f"{raw_url}/api2/json/cluster/resources", headers=headers, deadline=deadline)
+                if res_resp["ok"] and isinstance(res_resp.get("json"), dict):
+                    items = res_resp["json"].get("data", [])
+                    if isinstance(items, list):
+                        for item in items:
+                            if time.monotonic() >= deadline:
+                                break
+                            if not isinstance(item, dict):
+                                continue
+                            itype = item.get("type")
+                            if itype == "qemu" and len(vms_list) < MAX_PROXMOX_VMS and not any(v["id"] == item.get("vmid") for v in vms_list):
+                                vms_list.append({
+                                    "id": item.get("vmid"),
+                                    "name": item.get("name") or f"VM {item.get('vmid')}",
+                                    "status": item.get("status", "stopped"),
+                                    "running": item.get("status") == "running",
+                                    "node": item.get("node", "pve"),
+                                    "cpu": int(round(float(item.get("cpu", 0)) * 100)),
+                                    "memStr": format_bytes(item.get("mem", 0)),
+                                    "maxmemStr": format_bytes(item.get("maxmem", 0)),
+                                })
+                            elif itype == "lxc" and len(lxc_list) < MAX_PROXMOX_LXCS and not any(c["id"] == item.get("vmid") for c in lxc_list):
+                                lxc_list.append({
+                                    "id": item.get("vmid"),
+                                    "name": item.get("name") or f"CT {item.get('vmid')}",
+                                    "status": item.get("status", "stopped"),
+                                    "running": item.get("status") == "running",
+                                    "node": item.get("node", "pve"),
+                                    "cpu": int(round(float(item.get("cpu", 0)) * 100)),
+                                    "memStr": format_bytes(item.get("mem", 0)),
+                                    "maxmemStr": format_bytes(item.get("maxmem", 0)),
+                                })
+                            elif itype == "storage" and total_disk == 0:
+                                total_disk += item.get("maxdisk", 0)
+                                used_disk += item.get("disk", 0)
 
             # Sort VMs & LXCs: running first, then ID
             vms_list.sort(key=lambda x: (not x["running"], int(x["id"]) if str(x["id"]).isdigit() else 9999))
@@ -1153,8 +1181,9 @@ def poll_all_deep(config_path=DEFAULT_CONFIG, out_path=DEFAULT_STATE):
     services = cfg.get("services", [])
     results = []
 
+    hard_deadline = time.monotonic() + 25.0
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = [executor.submit(poll_service_deep, s) for s in services]
+        futures = [executor.submit(poll_service_deep, s, hard_deadline) for s in services]
         for f in concurrent.futures.as_completed(futures):
             try:
                 results.append(f.result())
