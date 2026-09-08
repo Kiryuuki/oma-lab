@@ -68,8 +68,11 @@ MAX_ERROR_BYTES = 32 * 1024     # 32 KB
 MAX_ICON_BYTES = 256 * 1024     # 256 KB
 MAX_STATE_BYTES = 512 * 1024    # 512 KB
 
-# Strict verified TLS Context
+# Strict verified TLS Context with fallback for self-signed homelab endpoints
 SSL_VERIFIED_CTX = ssl.create_default_context()
+SSL_UNVERIFIED_CTX = ssl.create_default_context()
+SSL_UNVERIFIED_CTX.check_hostname = False
+SSL_UNVERIFIED_CTX.verify_mode = ssl.CERT_NONE
 
 
 def is_loopback(hostname: str) -> bool:
@@ -321,7 +324,20 @@ def make_request(url, headers=None, method="GET", body=None, timeout=4.0, deadli
     req = urllib.request.Request(valid_url, headers=headers, data=data, method=method)
     start_t = time.perf_counter()
     try:
-        with opener.open(req, timeout=timeout) as resp:
+        try:
+            resp = opener.open(req, timeout=timeout)
+        except urllib.error.URLError as e:
+            reason_str = str(getattr(e, "reason", ""))
+            if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in reason_str:
+                unverified_opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=SSL_UNVERIFIED_CTX),
+                    SafeRedirectHandler(allow_http_loopback=allow_loopback),
+                )
+                resp = unverified_opener.open(req, timeout=timeout)
+            else:
+                raise
+
+        with resp:
             latency = int((time.perf_counter() - start_t) * 1000)
             final_url = resp.geturl()
             final_parsed = urllib.parse.urlsplit(final_url)
@@ -866,16 +882,27 @@ def poll_service_deep(service, deadline=None):
     # ----------------------------------------------------
     elif s_type in ("kasm", "kasm-workspaces", "kasm_workspaces"):
         payload = {"api_key": api_key, "api_key_secret": api_secret}
-        kasm_resp = make_request(f"{raw_url}/api/public/get_status", method="POST", body=payload)
-        if kasm_resp["ok"] and isinstance(kasm_resp.get("json"), dict):
+        kasm_resp = make_request(f"{raw_url}/api/public/get_kasms", method="POST", body=payload, deadline=deadline)
+        if not kasm_resp["ok"]:
+            kasm_resp = make_request(f"{raw_url}/api/public/get_status", method="POST", body=payload, deadline=deadline)
+        if not kasm_resp["ok"]:
+            kasm_resp = make_request(f"{raw_url}/api/__healthcheck", deadline=deadline)
+
+        if kasm_resp["ok"]:
             api_succeeded = True
             res["online"] = True
             res["latencyMs"] = kasm_resp["latencyMs"]
-            active_sessions = kasm_resp["json"].get("operational_status", {}).get("total_sessions", 0)
+            resp_json = kasm_resp.get("json") if isinstance(kasm_resp.get("json"), dict) else {}
+            if "kasms" in resp_json:
+                active_sessions = len(resp_json.get("kasms", []))
+                kasm_status = "operational"
+            else:
+                active_sessions = resp_json.get("operational_status", {}).get("total_sessions", 0)
+                kasm_status = resp_json.get("status", "operational")
 
             res["widgetsData"]["kasm_sessions"] = {
                 "totalSessions": active_sessions,
-                "status": kasm_resp["json"].get("status", "operational"),
+                "status": kasm_status,
             }
             if active_sessions > 0:
                 res["statusText"] = f"{active_sessions} active container session{'s' if active_sessions != 1 else ''}"
@@ -883,6 +910,8 @@ def poll_service_deep(service, deadline=None):
                 res["badgeType"] = "info"
             else:
                 res["statusText"] = f"Online · Operational ({kasm_resp['latencyMs']}ms)"
+                res["badge"] = "0 sessions"
+                res["badgeType"] = "success"
 
     # ----------------------------------------------------
     # 3. JELLYFIN

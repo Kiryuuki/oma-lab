@@ -24,8 +24,11 @@ MAX_RESPONSE_BYTES = 512 * 1024  # 512 KB
 MAX_ERROR_BYTES = 32 * 1024     # 32 KB
 MAX_STATE_BYTES = 512 * 1024    # 512 KB
 
-# Strict verified TLS context
+# Strict verified TLS context with fallback for self-signed homelab endpoints
 SSL_VERIFIED_CTX = ssl.create_default_context()
+SSL_UNVERIFIED_CTX = ssl.create_default_context()
+SSL_UNVERIFIED_CTX.check_hostname = False
+SSL_UNVERIFIED_CTX.verify_mode = ssl.CERT_NONE
 
 ICON_MAP = {
     "jellyfin": "󰟀",
@@ -185,7 +188,20 @@ def make_request(url, headers=None, method="GET", timeout=3.5):
     req = urllib.request.Request(valid_url, headers=headers, method=method)
     start_t = time.perf_counter()
     try:
-        with opener.open(req, timeout=timeout) as resp:
+        try:
+            resp = opener.open(req, timeout=timeout)
+        except urllib.error.URLError as e:
+            reason_str = str(getattr(e, "reason", ""))
+            if isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError) or "CERTIFICATE_VERIFY_FAILED" in reason_str:
+                unverified_opener = urllib.request.build_opener(
+                    urllib.request.HTTPSHandler(context=SSL_UNVERIFIED_CTX),
+                    SafeRedirectHandler(allow_http_loopback=allow_loopback),
+                )
+                resp = unverified_opener.open(req, timeout=timeout)
+            else:
+                raise
+
+        with resp:
             latency = int((time.perf_counter() - start_t) * 1000)
             final_url = resp.geturl()
             final_parsed = urllib.parse.urlsplit(final_url)
